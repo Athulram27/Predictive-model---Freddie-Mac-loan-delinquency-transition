@@ -1,0 +1,926 @@
+---
+title: "Freddie mac"
+author: "Athul"
+date: "2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Library
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+#This for KNN rediction for creit score
+#install.packages("VIM")
+#install.packages("DMwR")
+library(VIM) 
+
+```
+
+Load
+```{r load Files}
+setwd("C:/Users/athul/OneDrive/Desktop/AZ")
+master_train <- read_csv("Master.csv")
+master_test <- read_csv("Master_Test.csv")
+
+# Loop through each column in `train`
+for (col_name in colnames(master_train)) {
+  # Check if the column exists in `test` as well
+  if (col_name %in% colnames(master_test)) {
+    # Convert `test` column to the same type as the `train` column
+    master_test[[col_name]] <- as(master_test[[col_name]], class(master_train[[col_name]]))
+  }
+}
+
+master <- union(master_train, master_test)
+rm(master_test, master_train)
+gc()
+
+```
+
+Cleaning - Athul
+```{r}
+master <- master %>%
+  mutate(across(
+    c(
+      "FIRST TIME HOMEBUYER FLAG",
+      "METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN",
+      "OCCUPANCY STATUS",
+      "CHANNEL",
+      "PREPAYMENT PENALTY MORTGAGE (PPM) FLAG",
+      "AMORTIZATION TYPE",
+      "PROPERTY STATE",
+      "PROPERTY TYPE",
+      "LOAN SEQUENCE NUMBER",
+      "LOAN PURPOSE",
+      "SELLER NAME",
+      "SERVICER NAME",
+      "SUPER CONFORMING FLAG",
+      "PRE",
+      "PROGRAM INDICATOR",
+      "RELIEF REFINANCE INDICATOR",
+      "INTEREST ONLY INDICATOR (I/O INDICATOR)",
+      "MI CANCELLATION INDICATOR",
+      "CURRENT LOAN DELINQUENCY STATUS",
+      "MODIFICATION FLAG",
+      "ZERO BALANCE CODE",
+      "STEP MODIFICATION FLAG",
+      "PAYMENT DEFERRAL",
+      "DELINQUENCY DUE TO DISASTER",
+      "BORROWER ASSISTANCE STATUS CODE"
+    ),
+    as.factor
+  ),
+  across(
+    c(
+      "MI RECOVERIES",
+      "NET SALE PROCEEDS",
+      "NON MI RECOVERIES",
+      "TOTAL EXPENSES",
+      "LEGAL COSTS",
+      "MAINTENANCE AND PRESERVATION COSTS",
+      "TAXES AND INSURANCE",
+      "MISCELLANEOUS EXPENSES",
+      "ACTUAL LOSS CALCULATION"
+    ),
+    as.double
+  )
+  )
+
+master <- mutate(master,
+                 `FIRST PAYMENT DATE` = as.Date(paste0(as.character(`FIRST PAYMENT DATE`), "01"), format = "%Y%m%d"),
+                 `MATURITY DATE` = as.Date(paste0(as.character(`MATURITY DATE`), "01"), format = "%Y%m%d"),
+                 `MONTHLY REPORTING PERIOD` = as.Date(paste0(as.character(`MONTHLY REPORTING PERIOD`), "01"), format = "%Y%m%d"),
+                 `DEFECT SETTLEMENT DATE` = as.Date(paste0(as.character(`DEFECT SETTLEMENT DATE`), "01"), format = "%Y%m%d"),
+                 `ZERO BALANCE EFFECTIVE DATE` = as.Date(paste0(as.character(`ZERO BALANCE EFFECTIVE DATE`), "01"), format = "%Y%m%d"),
+                 `DUE DATE OF LAST PAID INSTALLMENT (DDLPI)` = as.Date(paste0(as.character(`DUE DATE OF LAST PAID INSTALLMENT (DDLPI)`), "01"), format = "%Y%m%d") 
+)
+
+master <- master %>%
+  mutate(report_month = str_sub(`MONTHLY REPORTING PERIOD`, 6,7),
+         report_quarter = as.factor(case_when(
+           report_month %in% c("01", "02", "03") ~ "Q1",
+           report_month %in% c("04","05", "06") ~ "Q2",
+           report_month %in% c("07", "08","09") ~ "Q3",
+           report_month %in% c("10", "11", "12") ~ "Q4")),
+  )
+
+
+master <- master %>%
+  group_by(`LOAN SEQUENCE NUMBER`) %>% # Group by Loan ID
+  mutate(
+    prev_1_month = lag(`CURRENT LOAN DELINQUENCY STATUS`,n = 1, order_by = `MONTHLY REPORTING PERIOD`),
+    prev_2_month = lag(`CURRENT LOAN DELINQUENCY STATUS`,n = 2, order_by = `MONTHLY REPORTING PERIOD`),
+    prev_3_month = lag(`CURRENT LOAN DELINQUENCY STATUS`,n = 3, order_by = `MONTHLY REPORTING PERIOD`),
+    Target = lead(`CURRENT LOAN DELINQUENCY STATUS`, n = 1, order_by = `MONTHLY REPORTING PERIOD`)) %>%
+  ungroup() # Ungroup after operation
+
+
+
+master <- master %>%
+  mutate(`RELIEF REFINANCE INDICATOR` = as.character(`RELIEF REFINANCE INDICATOR`),
+    `RELIEF REFINANCE INDICATOR` = replace_na(`RELIEF REFINANCE INDICATOR`, "N")) %>%
+  filter(`REMAINING MONTHS TO LEGAL MATURITY` != -1) %>%
+  mutate(
+    Loan_First_Payment_Quarter = paste0(
+      str_sub(`FIRST PAYMENT DATE`, 1, 4), # Extract the year part (first 4 characters)
+      case_when(
+        str_sub(`FIRST PAYMENT DATE`, 6, 7) %in% c("01", "02", "03") ~ "Q1",
+        str_sub(`FIRST PAYMENT DATE`, 6, 7) %in% c("04", "05", "06") ~ "Q2",
+        str_sub(`FIRST PAYMENT DATE`, 6, 7) %in% c("07", "08", "09") ~ "Q3",
+        str_sub(`FIRST PAYMENT DATE`, 6, 7) %in% c("10", "11", "12") ~ "Q4"
+      )
+    )
+  ) %>%
+  mutate(
+    # Extract origination year (characters 2-3)
+    Origination_Year = case_when(
+      str_sub(`LOAN SEQUENCE NUMBER`, 2, 3) == "99" ~ paste0("19", str_sub(`LOAN SEQUENCE NUMBER`, 2, 3)),
+      TRUE ~ paste0("20", str_sub(`LOAN SEQUENCE NUMBER`, 2, 3))
+    ),
+    # Extract quarter part from LOAN SEQUENCE NUMBER (character 4)
+    Origination_Quarter = str_sub(`LOAN SEQUENCE NUMBER`, 4, 5),
+    # Map quarters to the last month of each quarter for approximate date
+    Origination_Date = as.Date(case_when(
+      Origination_Quarter == "Q1" ~ paste0(Origination_Year, "-03-31"),
+      Origination_Quarter == "Q2" ~ paste0(Origination_Year, "-06-30"),
+      Origination_Quarter == "Q3" ~ paste0(Origination_Year, "-09-30"),
+      Origination_Quarter == "Q4" ~ paste0(Origination_Year, "-12-31")
+    ))
+  ) %>%
+  mutate(
+    # Map Loan_First_Payment_Quarter to the last month of each quarter
+    First_Payment_Date = as.Date(case_when(
+      str_sub(Loan_First_Payment_Quarter, 5, 6) == "Q1" ~ paste0(str_sub(Loan_First_Payment_Quarter, 1, 4), "-03-31"),
+      str_sub(Loan_First_Payment_Quarter, 5, 6) == "Q2" ~ paste0(str_sub(Loan_First_Payment_Quarter, 1, 4), "-06-30"),
+      str_sub(Loan_First_Payment_Quarter, 5, 6) == "Q3" ~ paste0(str_sub(Loan_First_Payment_Quarter, 1, 4), "-09-30"),
+      str_sub(Loan_First_Payment_Quarter, 5, 6) == "Q4" ~ paste0(str_sub(Loan_First_Payment_Quarter, 1, 4), "-12-31")
+    ))
+  ) %>%
+  mutate(
+    Moratorium_Period = interval(Origination_Date, First_Payment_Date) %/% months(1)
+  )
+
+
+master <- master %>%
+  mutate(reporting_year= str_sub(master$`MONTHLY REPORTING PERIOD`,1,4))
+# NA cleaning
+
+na_ <- master%>%
+  filter(`CURRENT LOAN DELINQUENCY STATUS`== 1)
+
+
+na_ <- na_ %>%
+  mutate(`FIRST TIME HOMEBUYER FLAG` = as.character(`FIRST TIME HOMEBUYER FLAG`)) %>%
+  mutate(`FIRST TIME HOMEBUYER FLAG` = ifelse(`FIRST TIME HOMEBUYER FLAG` == "9", "N", `FIRST TIME HOMEBUYER FLAG`))
+
+na_ <- na_ %>%
+  mutate(MSA_Code = case_when(
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85000 ~ '38060',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85100 ~ '38900',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85200 ~ '38900',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85300 ~ '38060',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85500 ~ '16740',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85600 ~ '12060',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85700 ~ '45300',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 85900 ~ '17140',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 86000 ~ '54300',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 86300 ~ '26420',
+    is.na(`METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`) & `POSTAL CODE` == 86400 ~ '25620',
+    TRUE ~ `METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`
+  ))#%>%
+  #select(-`METROPOLITAN STATISTICAL AREA (MSA) O
+  #        R METROPOLITAN`)
+
+na_ <- na_ %>%
+  mutate(MSA_Classification = case_when(
+    MSA_Code == 12060 ~ "Urban/Suburban",
+    MSA_Code == 16740 ~ "Urban/Rural",
+    MSA_Code == 17140 ~ "Urban/Rural",
+    MSA_Code == 22380 ~ "Rural",
+    MSA_Code == 25620 ~ "Rural",
+    MSA_Code == 26420 ~ "Rural",
+    MSA_Code == 29420 ~ "Urban/Rural",
+    MSA_Code == 38060 ~ "Urban/Suburban",
+    MSA_Code == 38900 ~ "Urban/Suburban",
+    MSA_Code == 39140 ~ "Urban/Rural",
+    MSA_Code == 39150 ~ "Rural",
+    MSA_Code == 43420 ~ "Rural",
+    MSA_Code == 45300 ~ "Urban/Suburban",
+    MSA_Code == 46060 ~ "Urban/Rural",
+    MSA_Code == 49740 ~ "Rural",
+    MSA_Code == 54300 ~ "Rural",
+    TRUE ~ "Unknown" # Default for any MSA codes not listed
+  ))
+
+na_ <- na_ %>%
+  mutate(`MORTGAGE INSURANCE PERCENTAGE (MI %)` = ifelse(`MORTGAGE INSURANCE PERCENTAGE (MI %)` == 999, 0, `MORTGAGE INSURANCE PERCENTAGE (MI %)`))
+
+#na_ <- na_ %>% 
+#  mutate(
+#    prev_1_month = as.factor(case_when(
+#      parse_integer(as.character(prev_1_month)) %in% c(0, 1, 2, 3) ~ parse_integer(as.character(prev_1_month)),
+#      TRUE ~ 999
+#    )),
+#    prev_2_month = as.factor(case_when(
+#      parse_integer(as.character(prev_2_month)) %in% c(0, 1, 2, 3) ~ parse_integer(as.character(prev_2_month)),
+#      TRUE ~ 999
+#    )),
+#    prev_3_month = as.factor(case_when(
+#      parse_integer(as.character(prev_3_month)) %in% c(0, 1, 2, 3) ~ parse_integer(as.character(prev_3_month)),
+#      TRUE ~ 999
+#    )),
+#    Target = as.factor(case_when(
+#      parse_integer(as.character(Target)) %in% c(0, 1, 2, 3) ~ parse_integer(as.character(Target)),
+#      TRUE ~ 999
+#    ))
+#  )
+
+
+na_ <- na_ %>%
+  mutate(seller_name = str_extract(`SELLER NAME`, "^\\S+\\s+\\S+")) %>%
+  group_by(seller_name) %>%
+  mutate(count_seller_name = n()) %>%
+  ungroup() %>%
+  mutate(seller_name = ifelse(count_seller_name > 150, seller_name, "Other sellers")) %>%
+  select(-count_seller_name, -`SELLER NAME` )  # Optional: Remove the count column
+
+na_ <- na_ %>%
+  mutate(servicer_name = str_extract(`SERVICER NAME`, "^\\S+\\s+\\S+")) %>%
+  group_by(servicer_name) %>%
+  mutate(count_servicer_name = n()) %>%
+  ungroup() %>%
+  mutate(servicer_name = ifelse(count_servicer_name > 150, servicer_name, "Other sellers")) %>%
+  select(-count_servicer_name, -`SERVICER NAME` )  # Optional: Remove the count column
+
+na_ <- na_ %>%
+  arrange(`LOAN SEQUENCE NUMBER`, `reporting_year`, `report_month`) %>%   # Ensure sorting by loan and time
+  group_by(`LOAN SEQUENCE NUMBER`) %>%                                     # Group by loan sequence number
+  mutate(count_default = cumsum(`CURRENT LOAN DELINQUENCY STATUS` != 0) - (`CURRENT LOAN DELINQUENCY STATUS` != 0)) %>%  # Cumulative delinquency count excluding current row
+  ungroup()  # Ungroup after mutation to avoid unwanted side effects
+
+```
+
+
+Cleaning Taniya
+```{r}
+#replace 9999 with NA
+na_ <- na_ %>%
+  mutate(
+    `CREDIT SCORE` = ifelse(`CREDIT SCORE` == 9999, NA, `CREDIT SCORE`),
+    `MODIFICATION FLAG` = ifelse(is.na(`MODIFICATION FLAG`), "N", `MODIFICATION FLAG`)
+  )
+
+# Selecting columns for KNN
+knn_data <- na_ %>%
+  select(
+    `CREDIT SCORE`,
+    `FIRST TIME HOMEBUYER FLAG`,
+    `OCCUPANCY STATUS`,
+    `ORIGINAL DEBT`,
+    `ORIGINAL UPB`,
+    `ORIGINAL INTEREST RATE`,
+    `LOAN PURPOSE`,
+    `PROPERTY TYPE`,
+    `PROPERTY STATE`,
+    `CURRENT LOAN DELINQUENCY STATUS`,
+    `NUMBER OF UNITS`,
+    `METROPOLITAN STATISTICAL AREA (MSA) OR METROPOLITAN`,
+    `MORTGAGE INSURANCE PERCENTAGE (MI %)`,
+    `ORIGINAL LOAN`
+  )
+
+# Perform KNN imputation
+knn_imputed_data <- kNN(knn_data, variable = "CREDIT SCORE", k = 5)
+
+# Update the `CREDIT SCORE` column in na_ with the imputed values
+na_$`CREDIT SCORE` <- knn_imputed_data$`CREDIT SCORE`
+
+
+rm(knn_data, knn_imputed_data)
+```
+
+
+Ronak Cleaning
+```{r}
+#ELTV (not sure but we can use Random forest here) a lot of NAs 
+#For Modifying PRE and adding new column
+na_ <- na_ %>%
+  mutate(
+    PRE_Category = as.factor(case_when(
+      str_starts(PRE, "A") ~ "Refinanced",
+      str_starts(PRE, "F") ~ "Fixed Rate",
+      TRUE ~ "Other"
+    ))
+  )
+```
+
+
+Adding external Data sources
+```{r}
+
+setwd("C:/Users/athul/OneDrive/Desktop/AZ")
+
+# load Macro economics
+CPI <- read_csv('CPI.csv')
+GDP <- read_csv('GDP.csv')
+HPI <- read_csv('HI.csv')
+HVI <- read_csv('House value index.csv')
+unemp<- read_csv('unemp.csv')
+
+
+
+na_ <- na_ %>%
+  mutate(reporting_year = as.character(reporting_year))
+
+
+#join house index
+HPI <- HPI %>%
+  mutate(Month = as.character(Month),
+         Month = str_pad(Month, width = 2, side = "left", pad = "0"),
+         Year = as.character(Year)) %>%
+  filter(HPI$GEO_Name == 'AZ')
+  
+
+
+na_ <- na_ %>%
+inner_join(HPI, by = c("reporting_year" = "Year", "report_month" = "Month"))
+
+#join GDP
+na_ <- na_ %>%
+  inner_join(GDP, by = c("reporting_year" = "Year"))
+
+
+#join CPI
+CPI <- CPI %>%
+  mutate(Quarter = case_when(Period == "S01" ~ "Q1",
+                             Period == "S02" ~ "Q2",
+                             Period == "S03" ~ "Q3",
+                             Period == "S04" ~ "Q4", 
+                            ))
+
+
+CPI <- CPI %>%
+  filter(CU <= 300)
+
+CPI <- CPI %>%
+  filter(Quarter == "Q3") %>%                        # Select only Q3 rows to copy for Q4
+  mutate(Quarter = "Q4") %>%                         # Change Quarter to Q4
+  bind_rows(CPI) %>%                                # Combine with the original data
+  arrange(Year, Quarter) %>%                         # Sort by Year and Quarter
+  mutate(Year = as.character(Year))
+
+
+na_ <- na_ %>%
+  inner_join(CPI, by = c( "reporting_year"= "Year", "report_quarter" = "Quarter"))
+
+# join Unemployment
+unemp <- unemp %>%
+  mutate(report_month = recode(Period,
+                               "Jan" = "01",
+                               "Feb" = "02",
+                               "Mar" = "03",
+                               "Apr" = "04",
+                               "May" = "05",
+                               "Jun" = "06",
+                               "Jul" = "07",
+                               "Aug" = "08",
+                               "Sep" = "09",
+                               "Oct" = "10",
+                               "Nov" = "11",
+                               "Dec" = "12"),
+         Year = as.character(Year))
+
+
+na_ <- na_ %>%
+  inner_join(unemp, by = c( "reporting_year"= "Year", "report_month" = "report_month"))
+
+rm(unemp)
+gc()
+
+HVI<- HVI %>% mutate(Year = as.character(Year))
+
+#join house value index
+na_ <- na_ %>%
+  inner_join(HVI, by = c( "reporting_year"= "Year", "report_month" = "Month"))
+
+rm(HVI, CPI, GDP, HPI)
+
+gc()
+```
+
+
+Selecting only the required features
+```{r}
+na_ <- na_ %>%
+  mutate(  GDP = parse_number(GDP)) %>%
+  mutate(across(c(`FIRST TIME HOMEBUYER FLAG`
+                , MSA_Code
+                , MSA_Classification
+                , `RELIEF REFINANCE INDICATOR`
+                , seller_name
+                , servicer_name
+                , prev_1_month
+                , prev_2_month
+                , prev_3_month
+                , Target),as.factor)
+  )
+
+data <- na_%>% select( 
+  reporting_year,
+  `CREDIT SCORE`,
+  `FIRST TIME HOMEBUYER FLAG`, #factor
+  #MSA_Code, #factor
+  MSA_Classification, #factor
+  `MORTGAGE INSURANCE PERCENTAGE (MI %)`, 
+  `NUMBER OF UNITS`, 
+  `OCCUPANCY STATUS`, #factor
+  `ORIGINAL DEBT`, 
+  `ORIGINAL LOAN`,
+  `ORIGINAL INTEREST RATE`,
+  CHANNEL, #factor
+  `PREPAYMENT PENALTY MORTGAGE (PPM) FLAG`,#factor
+  `PROPERTY TYPE`,#factor
+  `LOAN PURPOSE`,#factor
+  `ORIGINAL LOAN`,
+  `NUMBER OF BORROWERS`,
+   seller_name, #factor
+   servicer_name, #factor
+   PRE_Category, #factor
+  `RELIEF REFINANCE INDICATOR`, #factor
+  `CURRENT ACTUAL UPB`,
+  `LOAN AGE`,
+  `REMAINING MONTHS TO LEGAL MATURITY`,
+  `CURRENT INTEREST RATE`,
+  `CURRENT NON`,
+  `INTEREST BEARING UPB`,
+  `unemployment rate`,
+  `H Value Index`,
+#  `employment-population ratio`,
+  CU,
+  GDP, #number
+  Index_SA,
+  count_default,
+  prev_1_month, #factor
+  prev_2_month, #factor
+  prev_3_month, #factor
+  Target #factor
+)
+
+data <- data %>% filter(!is.na(`H Value Index`))
+
+#data <- data %>% select(
+#  -`unemployment rate`,
+#  -`H Value Index`,
+#  -`employment-population ratio`,
+#  -CU,
+#  -GDP, #number
+#  -Index_SA
+#  ) 
+
+gc()
+```
+
+Editing Target
+```{r}
+
+data <- data %>% 
+  mutate(
+    prev_1_month = as.factor(
+      case_when(
+        parse_integer(as.character(prev_1_month)) %in% c(0,1,2,3) ~ as.character(parse_integer(as.character(prev_1_month))),
+        prev_1_month == "NA" ~ "New Loan",
+        TRUE ~ ">60"
+    )),
+    prev_2_month = as.factor(case_when(
+        parse_integer(as.character(prev_2_month)) %in% c(0,1,2,3) ~ as.character(parse_integer(as.character(prev_2_month))),
+        prev_1_month == "NA" ~ "New Loan",
+        TRUE ~ ">60"
+    )),
+    prev_3_month = as.factor(case_when(
+        parse_integer(as.character(prev_3_month)) %in% c(0,1,2) ~ as.character(parse_integer(as.character(prev_3_month))),
+        prev_1_month == "NA" ~ "New Loan",
+        TRUE ~ ">60"
+    )),
+    Target = as.factor(case_when(
+        parse_integer(as.character(Target)) %in% c(0,1,2,3) ~ as.character(parse_integer(as.character(Target))),
+        prev_1_month == "NA" ~ "New Loan",
+        TRUE ~ ">60"
+    ))
+  )
+
+  
+#write.csv(final_data, "clnd_mrgd_data.csv", row.names = FALSE)
+```
+
+
+One hot Encoding 
+```{r}
+library(caret)
+one_hot_cols <- c("FIRST TIME HOMEBUYER FLAG", #factor
+    #"MSA_Code", #factor
+    "MSA_Classification", #factor
+    "OCCUPANCY STATUS", #factor
+    "CHANNEL", #factor
+    "PREPAYMENT PENALTY MORTGAGE (PPM) FLAG",#factor
+    "PROPERTY TYPE",#factor
+    "LOAN PURPOSE",#factor
+    "seller_name", #factor
+    "servicer_name", #factor
+    "PRE_Category", #factor
+    "RELIEF REFINANCE INDICATOR", #factor
+    "prev_1_month", #factor
+    "prev_2_month", #factor
+    "prev_3_month" #factor
+  )
+
+# One-hot encoding
+dummies_model <- dummyVars(~ ., data = data[, one_hot_cols], fullRank = TRUE)
+encoded_categorical <- predict(dummies_model, newdata = data[, one_hot_cols])
+
+
+# Convert the result into a data frame
+encoded_categorical <- as.data.frame(encoded_categorical)
+
+# Step 4: Combine the original dataframe's non-categorical columns with the encoded categorical columns
+final_data <- cbind(data[, setdiff(names(data), one_hot_cols)], encoded_categorical)
+
+rm(dummies_model, encoded_categorical, master)
+gc()
+
+```
+
+Writing file 
+```{r}
+final_train_2 <- final_data %>% filter(reporting_year<2019) %>% select(-reporting_year)
+#final_train <- final_data %>% filter(reporting_year < 2019, !reporting_year %in% c(2008, 2009)) %>% select(-reporting_year)
+final_test_2 <- final_data %>% filter(reporting_year>=2019) %>% select(-reporting_year)
+
+
+final_train_2 <- final_train_2 %>% select(
+  CURRENT_ACTUAL_UPB
+,INTEREST_BEARING_UPB
+,LOAN_AGE
+,count_default
+,REMAINING_MONTHS_TO_LEGAL_MATURITY
+,CREDIT_SCORE
+,Index_SA
+,H_Value_Index
+,unemployment_rate
+,ORIGINAL_DEBT
+, Target
+)
+
+final_test_2 <- final_test_2 %>% select(
+  CURRENT_ACTUAL_UPB
+,INTEREST_BEARING_UPB
+,LOAN_AGE
+,count_default
+,REMAINING_MONTHS_TO_LEGAL_MATURITY
+,CREDIT_SCORE
+,Index_SA
+,H_Value_Index
+,unemployment_rate
+,ORIGINAL_DEBT
+, Target
+)
+
+
+Final_test_precovid_2 <- final_data %>% filter(reporting_year>=2019 & reporting_year<2020) %>% select(-reporting_year, )
+Final_test_covid_2 <- final_data %>% filter(reporting_year>=2019 & reporting_year>=2020 & reporting_year<2023) %>% select(-reporting_year)
+Final_test_postcovid_2 <- final_data %>% filter(reporting_year>=2019 & reporting_year>=2023) %>% select(-reporting_year)
+
+
+clean_colnames <- function(df) {
+  # Replace spaces, hyphens, backticks, slashes, and punctuation with underscores
+  names(df) <- gsub(" |-|`|/|[[:punct:][:space:]]", "_", names(df))
+  
+  # Remove leading underscores
+  names(df) <- gsub("^_", "", names(df))
+  
+  return(df)
+}
+
+final_test_2 <- clean_colnames(final_test_2)
+final_train_2 <- clean_colnames(final_train_2)
+Final_test_precovid_2 <- clean_colnames(Final_test_precovid_2)
+Final_test_covid_2 <- clean_colnames(Final_test_covid_2)
+Final_test_postcovid_2 <- clean_colnames(Final_test_postcovid_2)
+
+write.csv(final_train_2, "final_train_2.csv", row.names = FALSE)
+write.csv(final_test_2, "final_test_2.csv", row.names = FALSE)
+
+write.csv(Final_test_precovid_2, "Final_test_precovid_2.csv", row.names = FALSE)
+write.csv(Final_test_covid_2, "Final_test_covid_2.csv", row.names = FALSE)
+write.csv(Final_test_postcovid_2, "Final_test_postcovid_2.csv", row.names = FALSE)
+
+gc()
+
+
+
+
+```
+
+
+Random Forest Model
+```{r}
+
+library(randomForest)
+
+set.seed(42)  # For reproducibility
+train_index <- createDataPartition(final_train_2$Target, p = 0.8, list = FALSE)
+train_data <- final_train_2[train_index, ]
+test_data <- final_train_2[-train_index, ]
+
+target_counts <- table(train_data$Target)
+valid_classes <- names(target_counts[target_counts > 0])
+train_data_filtered <- train_data[train_data$Target %in% valid_classes, ]
+
+train_data_filtered <- na.omit(train_data_filtered)
+
+# Step 2: Train the Random Forest model
+rf_model <- randomForest(Target ~ ., data = train_data_filtered, importance = TRUE, ntree = 150)
+
+# Step 3: View the model summary
+print(rf_model)
+
+# Step 4: Predict on the test data
+rf_predictions <- predict(rf_model, newdata = test_data)
+
+# Step 5: Evaluate the model using a confusion matrix
+conf_matrix <- confusionMatrix(rf_predictions, test_data$Target)
+print(conf_matrix)
+
+# Step 6: Check feature importance
+importance(rf_model)
+varImpPlot(rf_model)
+```
+
+
+Training Full model
+```{r}
+set.seed(42)  # For reproducibility
+rf_model_full <- randomForest(Target ~ ., data = final_train, importance = TRUE, ntree = 150)
+
+# Step 2: Predict on the final_test dataset
+rf_predictions_final_test <- predict(rf_model_full, newdata = final_test)
+
+# Step 3: Evaluate the model by comparing predictions with actual values
+# Check if final_test has the Target column`
+if ("Target" %in% colnames(final_test)) {
+    # Confusion matrix to evaluate the predictions
+    conf_matrix_final_test <- confusionMatrix(rf_predictions_final_test, final_test$Target)
+    print(conf_matrix_final_test)
+} else {
+    print("The final_test dataset does not contain a 'Target' column for evaluation.")
+}
+
+```
+
+Trying on prediction on pre
+```{r}
+set.seed(42)  # For reproducibility
+
+# Step 2: Predict on the Final_test_precovid dataset
+rf_predictions_Final_test_precovid <- predict(rf_model_full, newdata = Final_test_precovid)
+
+# Step 3: Evaluate the model by comparing predictions with actual values
+# Check if Final_test_precovid has the Target column`
+if ("Target" %in% colnames(Final_test_precovid)) {
+    # Confusion matrix to evaluate the predictions
+    conf_matrix_Final_test_precovid <- confusionMatrix(rf_predictions_Final_test_precovid, Final_test_precovid$Target)
+    print(conf_matrix_Final_test_precovid)
+} else {
+    print("The Final_test_precovid dataset does not contain a 'Target' column for evaluation.")
+}
+
+```
+
+Trying on prediction on during
+```{r}
+set.seed(42)  # For reproducibility
+
+# Step 2: Predict on the Final_test_covid dataset
+rf_predictions_Final_test_covid <- predict(rf_model_full, newdata = Final_test_covid)
+
+# Step 3: Evaluate the model by comparing predictions with actual values
+# Check if Final_test_covid has the Target column`
+if ("Target" %in% colnames(Final_test_covid)) {
+    # Confusion matrix to evaluate the predictions
+    conf_matrix_rf_predictions_Final_test_covid <- confusionMatrix(rf_predictions_Final_test_covid, Final_test_covid$Target)
+    print(conf_matrix_final_test)
+} else {
+    print("The Final_test_covid dataset does not contain a 'Target' column for evaluation.")
+}
+
+```
+
+Trying on prediction on post
+```{r}
+set.seed(42)  # For reproducibility
+
+# Step 2: Predict on the Final_test_postcovid dataset
+rf_predictions_Final_test_postcovid <- predict(rf_model_full, newdata = Final_test_postcovid)
+
+# Step 3: Evaluate the model by comparing predictions with actual values
+# Check if Final_test_postcovid has the Target column
+if ("Target" %in% colnames(Final_test_postcovid)) {
+    # Confusion matrix to evaluate the predictions
+    conf_matrix_Final_test_postcovid <- confusionMatrix(rf_predictions_Final_test_postcovid, Final_test_postcovid$Target)
+    print(conf_matrix_final_test)
+} else {
+    print("The Final_test_postcovid dataset does not contain a 'Target' column for evaluation.")
+}
+
+```
+
+
+Decision Tree
+```{r}
+library(rpart)
+library(caret)
+dt_model <- rpart(Target ~ ., data = train_data_filtered, method = "class",
+                  control = rpart.control(minsplit = 5, cp = 0.001))
+print(dt_model)
+printcp(dt_model)  # Display cross-validated error rate for pruning insights
+
+# Step 4: Predict on the test data
+dt_predictions <- predict(dt_model, newdata = test_data, type = "class")
+
+# Step 5: Evaluate the model using a confusion matrix
+conf_matrix <- confusionMatrix(dt_predictions, test_data$Target)
+print(conf_matrix)
+
+accuracy <- conf_matrix$overall['Accuracy']
+print(paste("Accuracy:", accuracy))
+
+```
+
+
+SVM
+```{r}
+library(e1071)
+
+# Train the SVM model
+svm_model <- svm(Target ~ ., data = train_data, kernel = "linear", cost = 1, max.iter = 1000)
+
+# Predict on the test data
+svm_predictions <- predict(svm_model, newdata = test_data)
+
+# Evaluate the model
+conf_matrix <- confusionMatrix(svm_predictions, test_data$Target)
+print(conf_matrix)
+
+# Print accuracy
+accuracy <- conf_matrix$overall['Accuracy']
+print(paste("Accuracy:", accuracy))
+```
+
+
+Backward Selection
+
+```{r}
+# Assuming you already have your train_data and test_data
+
+# Step 1: Train a Random Forest model using all features
+rf_model_full <- randomForest(Target ~ ., data = train_data_filtered, importance = TRUE, ntree = 150)
+
+# Step 2: Use the step function to perform backward feature selection
+# Since RandomForest doesn't directly support stepwise selection, we can use the caret package's rfe function for recursive feature elimination
+ctrl <- rfeControl(functions=rfFuncs, method="cv", number=10)  # Using cross-validation
+
+# Perform backward selection with random forest
+rf_selection <- rfe(train_data_filtered[, -which(names(train_data_filtered) == "Target")], 
+                    train_data_filtered$Target, 
+                    sizes=c(1:ncol(train_data_filtered)-1), 
+                    rfeControl=ctrl)
+
+# View the results of feature selection
+print(rf_selection)
+
+# Step 3: Train a Random Forest model on the selected features
+rf_model_selected <- randomForest(Target ~ ., data = train_data_filtered[, c(rf_selection$optVariables, "Target")], importance = TRUE, ntree = 150)
+
+# Step 4: Evaluate the model
+rf_predictions_selected <- predict(rf_model_selected, newdata = test_data)
+conf_matrix_selected <- confusionMatrix(rf_predictions_selected, test_data$Target)
+print(conf_matrix_selected)
+
+# Step 5: Check feature importance of selected features
+importance(rf_model_selected)
+varImpPlot(rf_model_selected)
+```
+
+
+Firward selection
+```{r}
+# Calculate feature variance
+feature_variance <- apply(train_data_filtered[, -which(names(train_data_filtered) == "Target")], 2, var)
+
+# Filter out features with very low variance (less than a small threshold)
+low_variance_features <- names(feature_variance[feature_variance < 0.01])
+train_data_filtered_reduced <- train_data_filtered[, !(names(train_data_filtered) %in% low_variance_features)]
+
+
+ctrl <- rfeControl(functions=rfFuncs, method="cv", number=10)
+
+# Perform backward selection with rpart (decision tree)
+rf_selection <- rfe(train_data_filtered[, -which(names(train_data_filtered) == "Target")], 
+                    train_data_filtered$Target, 
+                    sizes=c(1:ncol(train_data_filtered)-1), 
+                    rfeControl=ctrl)
+print(rf_selection)
+
+
+```
+
+
+```{r}
+library(caret)  # For createDataPartition and confusionMatrix
+
+# Ensure column names are clean
+final_test <- clean_colnames(final_test)
+final_train <- clean_colnames(final_train)
+
+# Step 1: Split the data
+set.seed(42)  # For reproducibility
+train_index <- createDataPartition(final_train$Target, p = 0.8, list = FALSE)
+train_data <- final_train[train_index, ]
+test_data <- final_train[-train_index, ]
+
+# Step 2: Train the Logistic Regression model
+# Note: glm assumes a formula where the dependent variable (Target) is binary/multinomial.
+# Convert Target to a factor if it's not already
+train_data$Target <- as.factor(train_data$Target)
+test_data$Target <- as.factor(test_data$Target)
+
+# Train logistic regression (binomial link for binary classification)
+log_model <- glm(Target ~ ., data = train_data, family = binomial)
+
+# Step 3: View the model summary
+summary(log_model)
+
+# Step 4: Predict on the test data
+# Predict probabilities
+log_probs <- predict(log_model, newdata = test_data, type = "response")
+
+# Convert probabilities to predicted classes (0.5 threshold for binary classification)
+log_predictions <- ifelse(log_probs > 0.5, levels(test_data$Target)[2], levels(test_data$Target)[1])
+
+# Step 5: Evaluate the model using a confusion matrix
+conf_matrix <- confusionMatrix(as.factor(log_predictions), test_data$Target)
+print(conf_matrix)
+
+```
+
+
+
+**No need to run this always**
+Check if any column has Nas
+```{r}
+na_counts <- data %>%
+  summarize(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
+  filter(na_count > 0)
+
+# Display columns with NA counts
+print(na_counts)
+
+rm(na_counts)
+
+```
+
+Removing Na s
+```{r}
+
+# Store column names before removing columns with too many NAs
+original_columns <- names(data)
+
+# Apply the filter to remove columns with more than 50% NAs
+threshold <- 0.5 * nrow(data)
+data <- data %>% select(where(~ sum(is.na(.)) < threshold))
+
+# Store column names after filtering
+remaining_columns <- names(data)
+
+# Find removed columns by set difference
+removed_columns <- setdiff(original_columns, remaining_columns)
+
+# Display removed columns
+print(removed_columns)
+
+```
+
+```{r}
+result <- data %>% select(`SELLER NAME`) %>%
+  mutate(group = str_extract(`SELLER NAME`, "^\\S+\\s+\\S+"))
+
+r <- result %>%
+  group_by(group) %>%
+  summarize(count = n())
+
+```
+
